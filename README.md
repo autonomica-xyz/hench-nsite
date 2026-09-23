@@ -34,7 +34,7 @@ via the Host header (`*.localhost` resolves to loopback in most browsers).
 Snapshot/named labels use base36 (50 chars) per the NIP.
 
 Both the relay and host bind `0.0.0.0`, so LAN devices can join — e.g. a
-phone running the [Hench](https://github.com/nostr-net/hench-web) app with
+phone running the [Hench](https://github.com/nostr-net/hench) app with
 its relay set to `ws://<lan-ip>:10547` is discoverable from the demo page.
 
 ## Publish a site
