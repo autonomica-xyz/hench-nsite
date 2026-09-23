@@ -1,0 +1,297 @@
+<!doctype html>
+<!-- Hench nsite demo — hench-web's dispatch console in one page, published as
+     an NIP-5A nsite: pick a worker, pick any tool it offers (form rendered
+     from the tool's JSON schema), pay the invoice, run the job. Client logic
+     lives in ./hench.js; branding (styles.css) is hench-web's. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hench — dispatch tasks to phone workers</title>
+<link rel="icon" href="data:," /><!-- no favicon blob; suppresses the 404 -->
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="shell">
+  <section class="workspace">
+    <header class="mast">
+      <div>
+        <p class="eyebrow">nsite demo · ContextVM task dispatch</p>
+        <h1>Hench</h1>
+      </div>
+      <div class="connection-pill" id="status">Scanning relays</div>
+    </header>
+
+    <form id="taskForm" class="console">
+      <label class="field">
+        <span class="field-label"><span class="field-name">Worker</span><span class="badge badge-required">required</span></span>
+        <select id="worker" required><option value="">scanning…</option></select>
+      </label>
+      <label class="field">
+        <span class="field-label"><span class="field-name">Tool</span><span class="badge badge-required">required</span></span>
+        <select id="tool" required disabled><option value="">select a worker first</option></select>
+      </label>
+      <div id="toolFields" class="tool-fields"></div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <label class="field">
+          <span class="field-label"><span class="field-name">Arguments JSON</span><span class="badge badge-optional">optional</span></span>
+          <textarea id="argsJson" rows="3" spellcheck="false" placeholder='{"url":"https://example.com"}'></textarea>
+          <small class="field-hint">Overrides the fields above when set.</small>
+        </label>
+      </details>
+      <button id="go" class="submit" type="submit"><span>Dispatch task</span></button>
+    </form>
+  </section>
+
+  <section class="results" aria-label="Task results">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Live tasks</p>
+        <h2>Jobs</h2>
+      </div>
+    </div>
+    <div id="emptyState" class="worker-empty">No tasks yet</div>
+    <div id="jobList">
+      <article class="job-card" id="jobCard" hidden>
+        <header class="job-head">
+          <div>
+            <strong class="job-title" id="jobTitle">task</strong>
+            <small class="job-sub" id="jobSub"></small>
+          </div>
+          <span class="connection-pill" id="jobState">Connecting</span>
+        </header>
+        <ol class="timeline" id="jobTimeline"></ol>
+        <div class="invoice" id="invoice" hidden>
+          <canvas id="qr" width="220" height="220"></canvas>
+          <div class="invoice-meta">
+            <output id="amount" class="amount"></output>
+            <div class="invoice-actions">
+              <button class="ghost" id="copyInvoice" type="button">Copy invoice</button>
+              <a class="ghost" id="openWallet" href="#" rel="noopener">Open in wallet</a>
+            </div>
+            <small>Pay with any Lightning wallet. The task runs after settlement.</small>
+          </div>
+        </div>
+        <pre class="result" id="out" hidden></pre>
+      </article>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { discoverWorkers, callTool, qrInto, DEFAULT_RELAYS } from "./hench.js";
+
+// Also scan the relay on the machine serving this page (test-local.sh runs
+// `nak serve --blossom` on :10547), so a phone worker on the same LAN that
+// announces there is discoverable without touching public relays.
+const RELAYS = [...DEFAULT_RELAYS, `ws://${location.hostname}:10547`];
+
+const $ = (id) => document.getElementById(id);
+// clipboard API needs a secure context (LAN http isn't one) — execCommand fallback
+const copyText = async (text) => {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = Object.assign(document.createElement("textarea"), { value: text });
+    document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+};
+const setStatus = (text, mode = "") => { $("status").textContent = text; $("status").className = `connection-pill${mode ? ` ${mode}` : ""}`; };
+const setJobState = (text, mode = "") => { $("jobState").textContent = text; $("jobState").className = `connection-pill${mode ? ` ${mode}` : ""}`; };
+const step = (text) => { const li = document.createElement("li"); li.textContent = text; $("jobTimeline").append(li); };
+
+const workers = await discoverWorkers({ relays: RELAYS });
+$("worker").replaceChildren(new Option("select a worker…", ""), ...workers.map((w) => new Option(`${w.name} (${w.tools.length} tools)`, w.pubkey)));
+setStatus(workers.length ? `${workers.length} workers online` : "No workers", workers.length ? "live" : "error");
+
+const selectedWorker = () => workers.find((w) => w.pubkey === $("worker").value);
+const selectedTool = () => selectedWorker()?.tools.find((t) => t.name === $("tool").value);
+
+$("worker").addEventListener("change", renderToolOptions);
+$("tool").addEventListener("change", renderToolFields);
+
+function renderToolOptions() {
+  const worker = selectedWorker();
+  const previous = $("tool").value;
+  $("tool").replaceChildren(new Option("select a tool…", ""), ...(worker ? worker.tools.map((t) => new Option(t.name, t.name)) : []));
+  $("tool").disabled = !worker;
+  if (previous && worker?.tools.some((t) => t.name === previous)) $("tool").value = previous;
+  renderToolFields();
+}
+
+function renderToolFields() {
+  const tool = selectedTool();
+  const box = $("toolFields");
+  box.replaceChildren();
+  if (!tool) return;
+
+  if (tool.description) {
+    const p = document.createElement("p");
+    p.className = "tool-description";
+    p.textContent = tool.description;
+    box.append(p);
+  }
+  const schema = tool.inputSchema || {};
+  const required = new Set(schema.required || []);
+  const properties = Object.entries(schema.properties || {});
+
+  const group = (legend, entries, isRequired) => {
+    const details = document.createElement("details");
+    details.className = `param-group${isRequired ? " param-required" : " param-optional"}`;
+    details.open = isRequired;
+    const summary = document.createElement("summary");
+    summary.textContent = legend;
+    details.append(summary);
+    for (const [name, property] of entries) details.append(createField(name, property, isRequired));
+    return details;
+  };
+  const req = properties.filter(([name]) => required.has(name));
+  const opt = properties.filter(([name]) => !required.has(name));
+  if (req.length) box.append(group("Required", req, true));
+  if (opt.length) box.append(group(opt.length === 1 ? "Optional parameter" : `Optional parameters · ${opt.length}`, opt, false));
+}
+
+function createField(name, property, isRequired) {
+  const type = Array.isArray(property.type) ? property.type.find((t) => t !== "null") : property.type || "string";
+  const wrap = document.createElement("label");
+  wrap.className = type === "boolean" ? "field field-check" : "field";
+  const head = document.createElement("span");
+  head.className = "field-label";
+  const title = document.createElement("span");
+  title.className = "field-name";
+  title.textContent = name;
+  const badge = document.createElement("span");
+  badge.className = `badge${isRequired ? " badge-required" : " badge-optional"}`;
+  badge.textContent = isRequired ? "required" : "optional";
+  head.append(title, badge);
+  wrap.append(head);
+
+  let input;
+  if (Array.isArray(property.enum)) {
+    input = document.createElement("select");
+    if (!isRequired) input.append(new Option("—", ""));
+    for (const v of property.enum) input.append(new Option(String(v), String(v)));
+    if (property.default !== undefined) input.value = String(property.default);
+  } else if (type === "boolean") {
+    const row = document.createElement("span");
+    row.className = "check-row";
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = property.default === true;
+    const label = document.createElement("span");
+    label.textContent = input.checked ? "On" : "Off";
+    input.addEventListener("change", () => (label.textContent = input.checked ? "On" : "Off"));
+    row.append(input, label);
+    wrap.append(row);
+  } else if (type === "integer" || type === "number") {
+    input = document.createElement("input");
+    input.type = "number";
+    if (type === "integer") input.step = "1";
+    if (property.default !== undefined) input.value = String(property.default);
+  } else {
+    input = /^(script|code|body|content|text|prompt|source|css|html|markdown)$/i.test(name) || property.maxLength >= 200
+      ? Object.assign(document.createElement("textarea"), { rows: 6, spellcheck: false })
+      : document.createElement("input");
+    input.type ||= property.format === "uri" || /url$/i.test(name) ? "url" : "text";
+    if (property.default !== undefined) input.value = String(property.default);
+    if (!input.value && (property.examples?.[0] ?? property.example) !== undefined) input.placeholder = String(property.examples?.[0] ?? property.example);
+  }
+  if (type !== "boolean") wrap.append(input);
+  input.dataset.argName = name;
+  input.dataset.argType = type;
+  if (isRequired && type !== "boolean") input.required = true;
+
+  if (property.description) {
+    const hint = document.createElement("small");
+    hint.className = "field-hint";
+    hint.textContent = property.description;
+    wrap.append(hint);
+  }
+  return wrap;
+}
+
+function collectArguments() {
+  const manual = $("argsJson").value.trim();
+  if (manual) {
+    const parsed = JSON.parse(manual);
+    if (typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Arguments JSON is not an object");
+    return parsed;
+  }
+  const args = {};
+  for (const input of $("toolFields").querySelectorAll("[data-arg-name]")) {
+    const name = input.dataset.argName;
+    if (input.type === "checkbox") args[name] = input.checked;
+    else {
+      const raw = input.value.trim();
+      if (raw === "") continue;
+      args[name] = input.dataset.argType === "integer" || input.dataset.argType === "number" ? Number(raw) : raw;
+    }
+  }
+  return args;
+}
+
+$("taskForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const workerPubkey = $("worker").value;
+  const tool = selectedTool();
+  if (!workerPubkey || !tool) return setStatus("Pick a worker and tool", "error");
+  let args;
+  try { args = collectArguments(); }
+  catch (error) { return setStatus(error.message, "error"); }
+
+  $("go").disabled = true;
+  $("emptyState").hidden = true;
+  $("jobCard").hidden = false;
+  $("jobTimeline").replaceChildren();
+  $("invoice").hidden = true;
+  $("out").hidden = true;
+  $("jobTitle").textContent = tool.name;
+  $("jobSub").textContent = `${selectedWorker().name} · ${new Date().toLocaleTimeString()}`;
+  setJobState("Connecting", "");
+  step(`dispatched ${tool.name}`);
+  setStatus("Dispatching", "live");
+  try {
+    const { text } = await callTool({
+      relays: RELAYS,
+      workerPubkey,
+      tool: tool.name,
+      args,
+      onEvent: async (e) => {
+        if (e.type === "payment_required") {
+          setJobState("Payment required", "");
+          step(`invoice: ${e.params.amount ?? "?"} sats (ttl ${e.params.ttl ?? "?"}s)`);
+          $("invoice").hidden = false;
+          $("amount").textContent = e.params.amount ? `${e.params.amount} sats` : "";
+          $("openWallet").href = `lightning:${e.params.pay_req || ""}`;
+          $("copyInvoice").onclick = async () => { await copyText(e.params.pay_req || ""); };
+          qrInto($("qr"), e.params).catch(() => {});
+        } else if (e.type === "payment_accepted") {
+          $("invoice").hidden = true;
+          setJobState("Paid — running", "live");
+          step("payment accepted, executing");
+        } else if (e.type === "payment_rejected") {
+          setJobState("Payment rejected", "error");
+          step(`payment rejected: ${e.params.message || "unknown"}`);
+        } else if (e.type === "progress") {
+          if (e.params.status) step(`worker: ${e.params.status}`);
+        }
+      },
+    });
+    $("out").hidden = false;
+    $("out").textContent = text || "(empty result)";
+    setJobState("Complete", "live");
+    step("result delivered");
+    setStatus("Done", "live");
+  } catch (error) {
+    $("out").hidden = false;
+    $("out").textContent = error.message;
+    setJobState("Failed", "error");
+    step(`failed: ${error.message}`);
+    setStatus(error.message, "error");
+  } finally {
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
