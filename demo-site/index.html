@@ -8,6 +8,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hench — dispatch tasks to phone workers</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self'; connect-src ws: wss:; img-src 'self' data:; base-uri 'none'" />
 <link rel="icon" href="data:," /><!-- no favicon blob; suppresses the 404 -->
 <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -22,7 +23,7 @@
       <div class="connection-pill" id="status">Scanning relays</div>
     </header>
 
-    <form id="taskForm" class="console">
+    <form id="taskForm" class="console" novalidate>
       <label class="field">
         <span class="field-label"><span class="field-name">Worker</span><span class="badge badge-required">required</span></span>
         <select id="worker" required><option value="">scanning…</option></select>
@@ -78,8 +79,10 @@
     </div>
   </section>
 </main>
+<footer class="foot"><a href="https://autonomica.xyz">autonomica.xyz</a></footer>
 
 <script type="module">
+import { cleanBolt11 } from "./lib.mjs";
 import { discoverWorkers, callTool, qrInto, DEFAULT_RELAYS } from "./hench.js";
 
 // Also scan the relay on the machine serving this page (test-local.sh runs
@@ -199,6 +202,7 @@ function createField(name, property, isRequired) {
   if (type !== "boolean") wrap.append(input);
   input.dataset.argName = name;
   input.dataset.argType = type;
+  if (isRequired) input.dataset.required = "true";
   if (isRequired && type !== "boolean") input.required = true;
 
   if (property.description) {
@@ -213,25 +217,34 @@ function createField(name, property, isRequired) {
 function collectArguments() {
   const manual = $("argsJson").value.trim();
   if (manual) {
-    const parsed = JSON.parse(manual);
-    if (typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Arguments JSON is not an object");
+    const parsed = parseJsonSafe(manual);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Arguments JSON is not an object");
     return parsed;
   }
   const args = {};
   for (const input of $("toolFields").querySelectorAll("[data-arg-name]")) {
     const name = input.dataset.argName;
-    if (input.type === "checkbox") args[name] = input.checked;
-    else {
+    if (input.type === "checkbox") {
+      if (input.checked || input.dataset.required === "true") args[name] = input.checked;
+    } else {
       const raw = input.value.trim();
       if (raw === "") continue;
-      args[name] = input.dataset.argType === "integer" || input.dataset.argType === "number" ? Number(raw) : raw;
+      if (input.dataset.argType === "integer" || input.dataset.argType === "number") {
+        const value = Number(raw);
+        if (!Number.isFinite(value)) throw new Error(`${name} must be a number`);
+        args[name] = value;
+      } else {
+        args[name] = raw;
+      }
     }
   }
   return args;
 }
+function parseJsonSafe(text) { try { return JSON.parse(text); } catch { return null; } }
 
 $("taskForm").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!$("argsJson").value.trim() && !$("taskForm").reportValidity()) return;
   const workerPubkey = $("worker").value;
   const tool = selectedTool();
   if (!workerPubkey || !tool) return setStatus("Pick a worker and tool", "error");
@@ -258,18 +271,21 @@ $("taskForm").addEventListener("submit", async (event) => {
       args,
       onEvent: async (e) => {
         if (e.type === "payment_required") {
+          const bolt11 = cleanBolt11(e.params.pay_req);
+          if (!bolt11) { step("payment_required arrived with a malformed invoice — ignored"); return; }
           setJobState("Payment required", "");
           step(`invoice: ${e.params.amount ?? "?"} sats (ttl ${e.params.ttl ?? "?"}s)`);
           $("invoice").hidden = false;
           $("amount").textContent = e.params.amount ? `${e.params.amount} sats` : "";
-          $("openWallet").href = `lightning:${e.params.pay_req || ""}`;
-          $("copyInvoice").onclick = async () => { await copyText(e.params.pay_req || ""); };
+          $("openWallet").href = `lightning:${bolt11}`;
+          $("copyInvoice").onclick = async () => { await copyText(bolt11); };
           qrInto($("qr"), e.params).catch(() => {});
         } else if (e.type === "payment_accepted") {
           $("invoice").hidden = true;
           setJobState("Paid — running", "live");
           step("payment accepted, executing");
         } else if (e.type === "payment_rejected") {
+          $("invoice").hidden = true;
           setJobState("Payment rejected", "error");
           step(`payment rejected: ${e.params.message || "unknown"}`);
         } else if (e.type === "progress") {
@@ -289,6 +305,7 @@ $("taskForm").addEventListener("submit", async (event) => {
     step(`failed: ${error.message}`);
     setStatus(error.message, "error");
   } finally {
+    $("invoice").hidden = true;
     $("go").disabled = false;
   }
 });

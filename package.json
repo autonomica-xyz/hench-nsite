@@ -1,0 +1,15 @@
+{
+  "name": "hench-nsite",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Publish and host NIP-5A nsites (Nostr + Blossom) — part of autonomica.xyz",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.4.0",
+    "undici": "^8.12.2"
+  }
+}
