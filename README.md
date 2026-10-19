@@ -116,12 +116,6 @@ blob server), `PORT`, `NSITE_BIND`, `NSITE_DEV`, `NSITE_ALLOW_PRIVATE`,
 - Blobs are buffered in memory up to `NSITE_MAX_BLOB` — fine for sites,
   not a CDN.
 
-## Release readiness
-
-See the [cross-project release-readiness report](https://github.com/autonomica-xyz/hench/blob/main/docs/release-readiness.html)
-for observed verification and remaining production checks. Download the HTML
-file to view or print it in a browser.
-
 ## License
 
 MIT (see [LICENSE](LICENSE)).
